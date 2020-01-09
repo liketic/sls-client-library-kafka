@@ -5,6 +5,7 @@ import com.aliyun.openservices.log.common.FastLog;
 import com.aliyun.openservices.log.common.FastLogGroup;
 import com.aliyun.openservices.log.common.LogGroupData;
 import com.aliyun.openservices.log.exception.LogException;
+import com.aliyun.openservices.log.response.ListLogStoresResponse;
 import com.aliyun.openservices.loghub.client.ClientWorker;
 import com.aliyun.openservices.loghub.client.config.LogHubConfig;
 import com.aliyun.openservices.loghub.client.exceptions.LogHubClientWorkerException;
@@ -33,7 +34,7 @@ public class SlsKafkaConsumer<T> implements Consumer<T> {
     private Properties props;
     private ExecutorService executorService;
     private BlockingQueue<SlsDataChunk> dataQueue;
-    private BlockingQueue<InternalOffset> offsets;
+    private BlockingQueue<SlsOffset> offsets;
     private List<ClientWorker> workers;
     private Client client;
     private Deserializer<T> deserializer;
@@ -56,10 +57,10 @@ public class SlsKafkaConsumer<T> implements Consumer<T> {
 
     @Override
     public Set<String> subscription() {
-        return null;
+        return subscription;
     }
 
-    private LogHubConfig.ConsumePosition parse(OffsetResetStrategy strategy) {
+    private LogHubConfig.ConsumePosition parseInitialPosition(OffsetResetStrategy strategy) {
         switch (strategy) {
             case LATEST:
                 return LogHubConfig.ConsumePosition.END_CURSOR;
@@ -68,11 +69,18 @@ public class SlsKafkaConsumer<T> implements Consumer<T> {
         }
     }
 
+    private void initClient() {
+        if (client == null) {
+            client = new Client(props.getProperty(SlsConfig.ENDPOINT_CONFIG),
+                    props.getProperty(SlsConfig.ACCESS_KEY_ID_CONFIG),
+                    props.getProperty(SlsConfig.ACCESS_KEY_CONFIG));
+        }
+    }
+
     @Override
     public void subscribe(Collection<String> topics) {
-        client = new Client(props.getProperty(SlsConfig.ENDPOINT_CONFIG),
-                props.getProperty(SlsConfig.ACCESS_KEY_ID_CONFIG),
-                props.getProperty(SlsConfig.ACCESS_KEY_CONFIG));
+        initClient();
+        OffsetResetStrategy strategy = OffsetResetStrategy.valueOf(props.getProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG));
         for (String topic : topics) {
             LogHubConfig logHubConfig = new LogHubConfig(
                     props.getProperty(ConsumerConfig.GROUP_ID_CONFIG),
@@ -82,7 +90,7 @@ public class SlsKafkaConsumer<T> implements Consumer<T> {
                     topic,
                     props.getProperty(SlsConfig.ACCESS_KEY_ID_CONFIG),
                     props.getProperty(SlsConfig.ACCESS_KEY_CONFIG),
-                    LogHubConfig.ConsumePosition.BEGIN_CURSOR);
+                    parseInitialPosition(strategy));
             try {
                 ClientWorker worker = new ClientWorker(new LogHubProcessorTestFactory(dataQueue, topic), logHubConfig);
                 executorService.submit(worker);
@@ -94,12 +102,12 @@ public class SlsKafkaConsumer<T> implements Consumer<T> {
         subscription.addAll(topics);
     }
 
-    private static class InternalOffset {
+    private static class SlsOffset {
         private String topic;
         private int partition;
         private String cursor;
 
-        public InternalOffset(String topic, int partition, String cursor) {
+        public SlsOffset(String topic, int partition, String cursor) {
             this.topic = topic;
             this.partition = partition;
             this.cursor = cursor;
@@ -122,6 +130,24 @@ public class SlsKafkaConsumer<T> implements Consumer<T> {
 
     @Override
     public void subscribe(Pattern pattern) {
+        initClient();
+        try {
+            ListLogStoresResponse response = client.ListLogStores(
+                    props.getProperty(SlsConfig.PROJECT_CONFIG),
+                    0,
+                    100,
+                    ""
+            );
+            List<String> logstores = new ArrayList<>();
+            for (String logstore : response.GetLogStores()) {
+                if (pattern.matcher(logstore).matches()) {
+                    logstores.add(logstore);
+                }
+            }
+            subscribe(logstores);
+        } catch (LogException ex) {
+            throw new KafkaException(ex);
+        }
     }
 
     @Override
@@ -129,7 +155,8 @@ public class SlsKafkaConsumer<T> implements Consumer<T> {
         for (ClientWorker worker : workers) {
             worker.shutdown();
         }
-        executorService.shutdown();
+        workers.clear();
+        subscription.clear();
     }
 
     @Override
@@ -139,10 +166,6 @@ public class SlsKafkaConsumer<T> implements Consumer<T> {
             if (chunk == null) {
                 return ConsumerRecords.empty();
             }
-//            long offset = Long.parseLong(new String(Base64.decodeBase64(chunk.getCursor().getBytes())));
-            InternalOffset internalOffset = new InternalOffset(chunk.getLogstore(),
-                    chunk.getShard(), chunk.getCursor());
-            offsets.add(internalOffset);
             if (deserializer == null) {
                 Class keyDeserializerClass = DefaultDeserializer.class;
                 String className = props.getProperty(SlsConfig.DESERIALIZER_CLASS_CONFIG);
@@ -182,6 +205,8 @@ public class SlsKafkaConsumer<T> implements Consumer<T> {
                 }
             }
             topicToRecords.put(partition, records);
+            SlsOffset offset = new SlsOffset(chunk.getLogstore(), chunk.getShard(), chunk.getCursor());
+            offsets.add(offset);
             return new ConsumerRecords<>(topicToRecords);
         } catch (InterruptedException e) {
             return ConsumerRecords.empty();
@@ -190,7 +215,7 @@ public class SlsKafkaConsumer<T> implements Consumer<T> {
 
     @Override
     public void commitSync() {
-        for (InternalOffset offset : offsets) {
+        for (SlsOffset offset : offsets) {
             try {
                 client.UpdateCheckPoint(
                         props.getProperty(SlsConfig.PROJECT_CONFIG),
@@ -244,7 +269,6 @@ public class SlsKafkaConsumer<T> implements Consumer<T> {
 
     @Override
     public void seekToEnd(Collection<TopicPartition> partitions) {
-
     }
 
     @Override
@@ -274,5 +298,7 @@ public class SlsKafkaConsumer<T> implements Consumer<T> {
 
     @Override
     public void close() {
+        unsubscribe();
+        executorService.shutdown();
     }
 }
